@@ -3,9 +3,9 @@ use std::{io, net::SocketAddr, path::PathBuf};
 use cratetorrent::prelude::*;
 use flexi_logger::FileSpec;
 use structopt::StructOpt;
-use termion::{
-    input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen,
-};
+use termion::raw::IntoRawMode;
+use termion::screen::IntoAlternateScreen;
+use termion::input::MouseTerminal;
 use tui::{backend::TermionBackend, Terminal};
 
 use app::App;
@@ -57,38 +57,38 @@ fn parse_mode(s: &str) -> Mode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // initialize logging
     flexi_logger::Logger::try_with_env()?
         .log_to_file(FileSpec::default().directory("/tmp/cratetorrent"))
         .start()?;
 
-    // parse cli args
+    // parse CLI arguments
     let mut args = Args::from_args();
     if let Mode::Download { seeds } = &mut args.mode {
         *seeds = args.seeds.clone().unwrap_or_default();
-    };
-
+    }
     let quit_after_complete = args.quit_after_complete;
 
     // set up TUI backend
-    let stdout = io::stdout().into_raw_mode()?;
-    let stdout = MouseTerminal::from(stdout);
-    let stdout = AlternateScreen::from(stdout);
+    let stdout = io::stdout()
+        .into_raw_mode()?                // RawTerminal<Stdout>
+        .into_alternate_screen()?        // AlternateScreen<RawTerminal<Stdout>>
+        ;
+    let stdout = MouseTerminal::from(stdout);  // Mouse enabled
     let backend = TermionBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // set up app state and input events
+    // initialize application state
     let mut app = App::new(args.download_dir.clone())?;
     let mut keys = Keys::new(key::EXIT_KEY);
 
-    // for now we only support creation of a single torrent, but technically
-    // everything is in place to allow running multiple torrents at the same
-    // time
+    // start the single torrent
     app.create_torrent(args)?;
 
-    // draw initial state
+    // initial draw
     terminal.draw(|f| ui::draw(f, &mut app))?;
 
-    // wait for stdin input and alerts from the engine
+    // main event loop
     let mut run = true;
     while run {
         tokio::select! {
@@ -102,31 +102,23 @@ async fn main() -> Result<()> {
                     Alert::TorrentStats { id, stats } => {
                         app.update_torrent_state(id, *stats);
                     }
-                    Alert::TorrentComplete(_) => {
-                        // TODO: some notification/popup
-                        if quit_after_complete {
-                            run = false;
-                        }
+                    Alert::TorrentComplete(_) if quit_after_complete => {
+                        run = false;
                     }
-                    // TODO(https://github.com/mandreyel/cratetorrent/issues/85):
-                    // handle errors
-                    _ => (),
+                    _ => {}
                 }
             }
         }
 
-        // draw ui with updated state
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
-        // we want to draw once more before breaking out of the loop as
-        // otherwise the completion of the ui is not rendered, which will result
-        // in a screen as though the app froze
+        // one final draw before exit so completion state is visible
         if !run {
             break;
         }
     }
 
+    // shut down the engine gracefully
     app.engine.shutdown().await?;
-
     Ok(())
 }
