@@ -52,10 +52,6 @@ pub use state::{ConnectionState, SessionState};
 pub type Bitfield = BitVec<usize, Msb0>;
 
 // These are submodules of the peer module (peer.rs)
-// Their content is not included here but would be in separate files:
-// - peer/codec.rs
-// - peer/error.rs
-// - peer/state.rs
 mod codec;
 pub mod error;
 mod state;
@@ -89,6 +85,8 @@ pub(crate) enum Command {
     },
     /// Eventually shut down the peer session.
     Shutdown,
+    #[cfg(feature = "ratio")]
+    CheckRatio,
 }
 
 /// Determines who initiated the connection.
@@ -199,19 +197,14 @@ pub(super) struct PeerInfo {
 
 impl PeerSession {
     /// Creates a new session with the peer at the given address.
-    ///
-    /// # Important
-    ///
-    /// This constructor only initializes the session components but does not
-    /// actually start it. See [`Self::start`].
     pub fn new(
         torrent: Arc<TorrentContext>,
         addr: SocketAddr,
     ) -> (Self, Sender) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let piece_count = torrent.storage.piece_count;
-        let log_target =
-            format!("cratetorrent::peer [{}][{}]", torrent.id, addr);
+        let log_target = format!("cratetorrent::peer [{}][{}]", torrent.id, addr);
+
         (
             Self {
                 torrent,
@@ -219,7 +212,6 @@ impl PeerSession {
                 cmd_rx,
                 peer: PeerInfo {
                     addr,
-                    // Use BitVec::repeat for initialization
                     pieces: BitVec::repeat(false, piece_count),
                     piece_count: 0,
                     id: Default::default(),
@@ -234,6 +226,30 @@ impl PeerSession {
             cmd_tx,
         )
     }
+
+    #[cfg(feature = "ratio")]
+    fn check_ratio(&self) -> bool {
+        if let Some(max_ratio) = self.torrent.config.max_ratio {
+            let downloaded = self.ctx.counters.payload.down.total();
+            if downloaded > 0 {
+                let uploaded = self.ctx.counters.payload.up.total();
+                let ratio = uploaded as f64 / downloaded as f64;
+
+                if ratio >= max_ratio {
+                    log::info!(
+                        target: &self.ctx.log_target,
+                        "Ratio limit reached ({:.2} >= {:.2})",
+                        ratio,
+                        max_ratio
+                    );
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+
 
     /// Starts an outbound peer session.
     ///
@@ -251,6 +267,50 @@ impl PeerSession {
 
         let socket = Framed::new(socket, HandshakeCodec);
         self.start(socket, Direction::Outbound).await
+    }
+
+    async fn handle_command(&mut self, cmd: Command) -> Result<()> {
+        match cmd {
+            Command::Block(block) => {
+                // Handle block without needing sink - store it or process it
+                log::info!(
+                target: &self.ctx.log_target,
+                "Received block for piece {}", 
+                block.piece_index
+            );
+                // Additional block handling logic if needed
+            }
+            Command::PieceCompletion { index, in_endgame } => {
+                self.ctx.in_endgame = in_endgame;
+                log::info!(
+                target: &self.ctx.log_target,
+                "Piece {} completed, in_endgame: {}", 
+                index,
+                in_endgame
+            );
+            }
+            Command::Shutdown => {
+                log::info!(
+                target: &self.ctx.log_target,
+                "Shutting down session"
+            );
+                return Ok(());
+            }
+            #[cfg(feature = "ratio")]
+            Command::CheckRatio => {
+                if self.check_ratio() {
+                    // Update peer choke state
+                    self.ctx.state.is_peer_choked = true;
+                    // Clear any pending upload requests
+                    self.incoming_requests.clear();
+                    log::info!(
+                    target: &self.ctx.log_target,
+                    "Ratio limit reached, choking peer and clearing requests"
+                );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Starts an inbound peer session from an existing TCP connection.
@@ -405,9 +465,6 @@ impl PeerSession {
         // a reference to the stream in the loop
         let (mut sink, mut stream) = socket.split();
 
-        // This is the beginning of the session, which is the only time
-        // a peer is allowed to advertise their pieces. If we have pieces
-        // available, send a bitfield message.
         {
             let piece_picker_guard = self.torrent.piece_picker.read().await;
             let own_pieces = piece_picker_guard.own_pieces();
@@ -418,84 +475,86 @@ impl PeerSession {
             }
         }
 
-        // used for collecting session stats every second
         let mut tick_timer = time::interval(Duration::from_secs(1));
 
-        // start the loop for receiving messages from peer and commands from
-        // other parts of the engine
         loop {
             tokio::select! {
-                now = tick_timer.tick() => {
-                    self.tick(&mut sink, now.into_std()).await?;
-                }
-                Some(msg) = stream.next() => {
-                    let msg = msg?;
+            now = tick_timer.tick() => {
+                self.tick(&mut sink, now.into_std()).await?;
+            }
+            Some(msg) = stream.next() => {
+                let msg = msg?;
 
-                    // handle bitfield message separately as it may only be
-                    // received directly after the handshake (later once we
-                    // implement the FAST extension, there will be other piece
-                    // availability related messages to handle)
-                    if self.ctx.state.connection == ConnectionState::AvailabilityExchange {
-                        if let Message::Bitfield(bitfield) = msg {
-                            self.handle_bitfield_msg(&mut sink, bitfield).await?;
-                        } else {
-                            // it's not mandatory to send a bitfield message
-                            // right after the handshake
-                            self.handle_msg(&mut sink, msg).await?;
-                        }
-
-                        // if neither of us have any pieces, disconnect, there
-                        // is no point in keeping the connection alive
-                        if self
-                            .torrent
-                            .piece_picker
-                            .read()
-                            .await
-                            .own_pieces()
-                            .not_any() // Assumes BitVec has not_any()
-                            && self.peer.pieces.not_any() // Assumes BitVec has not_any()
-                        {
-                            log::warn!(
-                                target: &self.ctx.log_target,
-                                "Neither side of connection has any pieces, disconnecting"
-                            );
-                            return Ok(());
-                        }
-
-                        // enter connected state
-                        self.ctx.set_connection_state(ConnectionState::Connected);
-                        log::info!(target: &self.ctx.log_target,
-                            "Session state: {:?}",
-                            self.ctx.state.connection
-                        );
+                if self.ctx.state.connection == ConnectionState::AvailabilityExchange {
+                    if let Message::Bitfield(bitfield) = msg {
+                        self.handle_bitfield_msg(&mut sink, bitfield).await?;
                     } else {
                         self.handle_msg(&mut sink, msg).await?;
                     }
+
+                    if self.torrent.piece_picker.read().await.own_pieces().not_any()
+                        && self.peer.pieces.not_any()
+                    {
+                        log::warn!(
+                            target: &self.ctx.log_target,
+                            "Neither side of connection has any pieces, disconnecting"
+                        );
+                        return Ok(());
+                    }
+
+                    self.ctx.set_connection_state(ConnectionState::Connected);
+                    log::info!(target: &self.ctx.log_target,
+                        "Session state: {:?}",
+                        self.ctx.state.connection
+                    );
+                } else {
+                    self.handle_msg(&mut sink, msg).await?;
                 }
-                Some(cmd) = self.cmd_rx.recv() => {
-                    match cmd {
-                        Command::Block(block)=> {
-                            self.send_block(&mut sink, block).await?;
-                        }
-                        Command::PieceCompletion { index, in_endgame } => {
-                            self.ctx.in_endgame = in_endgame;
-                            self.handle_piece_completion(&mut sink, index).await?;
-                        }
-                        Command::Shutdown => {
-                            log::info!(
-                                target: &self.ctx.log_target,
-                                "Shutting down session"
-                            );
-                            break;
+            }
+            Some(cmd) = self.cmd_rx.recv() => {
+                match cmd {
+                    Command::Block(block) => {
+                        self.send_block(&mut sink, block).await?;
+                    }
+                    Command::PieceCompletion { index, in_endgame } => {
+                        self.ctx.in_endgame = in_endgame;
+                        self.handle_piece_completion(&mut sink, index).await?;
+                    }
+                    Command::Shutdown => {
+                        log::info!(
+                            target: &self.ctx.log_target,
+                            "Shutting down session"
+                        );
+                        break;
+                    }
+                    #[cfg(feature = "ratio")]
+                    Command::CheckRatio => {
+                        let session_info = self.session_info();
+                        let downloaded = session_info.counters.payload.down.total();
+                        if downloaded > 0 {
+                            let uploaded = session_info.counters.payload.up.total();
+                            let ratio = uploaded as f64 / downloaded as f64;
+                            
+                            if let Some(max_ratio) = self.torrent.config.max_ratio {
+                                if ratio >= max_ratio {
+                                    log::info!(
+                                        target: &self.ctx.log_target,
+                                        "Ratio limit {} reached (current: {:.2}), disconnecting",
+                                        max_ratio,
+                                        ratio
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        }
 
         Ok(())
     }
-
     /// The session tick, as in "the tick of a clock", which runs every second
     /// to perform periodic updates.
     ///
@@ -581,6 +640,27 @@ impl PeerSession {
 
         Ok(())
     }
+
+    #[cfg(feature = "ratio")]
+    async fn handle_ratio_check(&mut self) {
+        // Get the current ratio limit from config
+        if let Some(max_ratio) = self.torrent.config.max_ratio {
+            let downloaded = self.ctx.counters.payload.down.total();
+            if downloaded > 0 {
+                let uploaded = self.ctx.counters.payload.up.total();
+                let ratio = uploaded as f64 / downloaded as f64;
+
+                if ratio >= max_ratio {
+                    // Stop uploading by updating choke state
+                    self.ctx.state.is_peer_choked = true;
+                    // Cancel any pending upload requests
+                    self.incoming_requests.clear();
+                }
+            }
+        }
+    }
+
+
 
     /// Times out the peer if it hasn't sent a request in too long.
     async fn check_request_timeout(
@@ -679,7 +759,7 @@ impl PeerSession {
         // According to the spec if the remainder contains any non-zero
         // bits, we need to abort the connection. Not sure if this is too
         // strict, there doesn't seem much harm in it so we skip the check.
-        bitfield.resize(self.torrent.storage.piece_count, false); // BitVec::resize
+        bitfield.resize(self.torrent.storage.piece_count, false);
 
         // register peer's pieces with piece picker and determine interest in it
         let is_interested = self
@@ -689,7 +769,7 @@ impl PeerSession {
             .await
             .register_peer_pieces(&bitfield);
         self.peer.pieces = bitfield;
-        self.peer.piece_count = self.peer.pieces.count_ones(); // BitVec::count_ones
+        self.peer.piece_count = self.peer.pieces.count_ones();
         if self.peer.piece_count == self.torrent.storage.piece_count {
             log::info!(target: &self.ctx.log_target, "Peer is a seed, interested: {}", is_interested);
         } else {
@@ -751,16 +831,34 @@ impl PeerSession {
             }
             Message::Interested => {
                 if !self.ctx.state.is_peer_interested {
-                    // TODO(https://github.com/mandreyel/cratetorrent/issues/60):
-                    // we currently unchoke peer unconditionally, but we should
-                    // implement the proper unchoke algorithm in `Torrent`
-                    log::info!(target: &self.ctx.log_target, "Peer became interested");
-                    log::info!(target: &self.ctx.log_target, "Unchoking peer");
-                    self.ctx.update_state(|state| {
-                        state.is_peer_interested = true;
-                        state.is_peer_choked = false;
-                    });
-                    sink.send(Message::Unchoke).await?;
+                    // Check for ghost leech mode when appropriate
+                    #[cfg(feature = "ghostleech")]
+                    if self.torrent.config.ghost_leech {
+                        log::info!(target: &self.ctx.log_target, "Peer became interested, but we're in ghost-leech mode");
+                        log::info!(target: &self.ctx.log_target, "Keeping peer choked");
+                        self.ctx.update_state(|state| {
+                            state.is_peer_interested = true;
+                        });
+                    } else {
+                        log::info!(target: &self.ctx.log_target, "Peer became interested");
+                        log::info!(target: &self.ctx.log_target, "Unchoking peer");
+                        self.ctx.update_state(|state| {
+                            state.is_peer_interested = true;
+                            state.is_peer_choked = false;
+                        });
+                        sink.send(Message::Unchoke).await?;
+                    }
+
+                    #[cfg(not(feature = "ghostleech"))]
+                    {
+                        log::info!(target: &self.ctx.log_target, "Peer became interested");
+                        log::info!(target: &self.ctx.log_target, "Unchoking peer");
+                        self.ctx.update_state(|state| {
+                            state.is_peer_interested = true;
+                            state.is_peer_choked = false;
+                        });
+                        sink.send(Message::Unchoke).await?;
+                    }
                 }
             }
             Message::NotInterested => {
@@ -875,7 +973,6 @@ impl PeerSession {
                     index,
                     self.torrent.storage.piece_len(index),
                 );
-
                 download.pick_blocks(
                     to_request_count,
                     &mut requests,
@@ -1011,6 +1108,25 @@ impl PeerSession {
             return Ok(());
         }
 
+        // Check for ratio enforcement when appropriate
+        #[cfg(feature = "ratio")]
+        if let Some(max_r) = self.torrent.config.max_ratio {
+            let stats = self.session_info();
+            let up = stats.counters.payload.up.total();
+            let down = stats.counters.payload.down.total();
+
+            // Do not upload if we have reached our ratio limit and have downloaded something
+            if down > 0 && (up as f64 / down as f64) >= max_r {
+                log::info!(
+                    target: &self.ctx.log_target,
+                    "Ignoring request due to max ratio: {:.2} >= {:.2}",
+                    up as f64 / down as f64,
+                    max_r
+                );
+                return Ok(());
+            }
+        }
+
         log::info!(target: &self.ctx.log_target, "Issuing disk IO read for block {}", block_info);
         self.incoming_requests.insert(block_info);
 
@@ -1039,6 +1155,36 @@ impl PeerSession {
             return Ok(());
         }
 
+        // Check for ghost-leech mode when appropriate
+        #[cfg(feature = "ghostleech")]
+        if self.torrent.config.ghost_leech {
+            log::info!(
+                target: &self.ctx.log_target,
+                "Ghost-leech mode active, not sending block {}", 
+                info
+            );
+            return Ok(());
+        }
+
+        // Check for ratio enforcement when appropriate
+        #[cfg(feature = "ratio")]
+        if let Some(max_r) = self.torrent.config.max_ratio {
+            let stats = self.session_info();
+            let up = stats.counters.payload.up.total();
+            let down = stats.counters.payload.down.total();
+
+            // Do not upload if we have reached our ratio limit and have downloaded something
+            if down > 0 && (up as f64 / down as f64) >= max_r {
+                log::info!(
+                    target: &self.ctx.log_target,
+                    "Not sending block due to max ratio: {:.2} >= {:.2}",
+                    up as f64 / down as f64,
+                    max_r
+                );
+                return Ok(());
+            }
+        }
+
         log::info!(target: &self.ctx.log_target, "Sending {}", info);
         sink.send(Message::Block {
             piece_index: block.piece_index,
@@ -1062,11 +1208,11 @@ impl PeerSession {
         log::info!(target: &self.ctx.log_target, "Peer has piece {}", piece_index);
         self.validate_piece_index(piece_index)?;
 
-        if self.peer.pieces[piece_index] { // BitVec index access
+        if self.peer.pieces[piece_index] {
             return Ok(());
         }
 
-        self.peer.pieces.set(piece_index, true); // BitVec::set
+        self.peer.pieces.set(piece_index, true);
         self.peer.piece_count += 1;
 
         let is_interested = self
@@ -1139,7 +1285,7 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, PeerCodec>, Message>,
         piece_index: PieceIndex,
     ) -> Result<()> {
-        if !self.peer.pieces[piece_index] { // BitVec index access
+        if !self.peer.pieces[piece_index] {
             log::debug!(
                 target: &self.ctx.log_target,
                 "Announcing piece {}",

@@ -69,8 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // listen to alerts from the engine
-    while let Some(alert) = alert_rx.next().await {
-        match alert {
+    while let Some(alert) = alert_rx.recv().await {        match alert {
             Alert::TorrentStats { id, stats } => {
                 println!("{}: {:#?}", id, stats);
             }

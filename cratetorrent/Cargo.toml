@@ -35,3 +35,23 @@ bytes = "1.10.1"
 [dev-dependencies]
 mockito = { version = "1.7.0" }
 tokio = { version = "1.0", features = ["macros", "rt"] }
+
+
+[features]
+# No extras by default
+default = []
+
+# Enable client-string & peer_id spoofing
+spoofing = []
+
+# Enable injecting extra peers into tracker responses
+peer_inject = []
+
+# Never upload to peers
+ghostleech = []
+
+# stop uploading when a max ratio is reached
+ratio = []
+
+# Multiply upload ratio by a factor?
+upload_multiplier = []

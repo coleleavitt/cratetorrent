@@ -5,11 +5,17 @@ RUN apt-get -y update && \
     apt-get clean && \
     apt-get autoremove
 
+# Create a non-root user and group
+RUN groupadd -r cratetorrent && useradd -r -g cratetorrent cratetorrent
+
 WORKDIR /cratetorrent
 
 COPY /target/release/test-cli .
 
-# Note we're not quoting the arguments because e.g. in case of the seeds arg an
-# empty string may be given and if quoted that would result in a `''`, which
-# trips the cli arg parser.
+# Set proper ownership
+RUN chown -R cratetorrent:cratetorrent /cratetorrent
+
+# Switch to non-root user
+USER cratetorrent
+
 CMD ./test-cli --listen ${LISTEN} --mode ${MODE} --seeds ${SEEDS} --metainfo ${METAINFO_PATH} --download-dir ${DOWNLOAD_DIR}

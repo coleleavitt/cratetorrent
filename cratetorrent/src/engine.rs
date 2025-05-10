@@ -1,18 +1,13 @@
 //! The engine is the top-level coordinator that runs and manages all entities
 //! in the torrent engine. The user interacts with the engine via the
-//! [`EngineHandle`] which exposes a restricted public API. The underlying
-//! communication method is [tokio mpsc
-//! channels](https://docs.rs/tokio/0.2.16/tokio/sync/mpsc).
+//! [`EngineHandle`] which exposes a restricted public API.
 //!
-//! The engine is spawned as a [tokio
-//! task](https://docs.rs/tokio/0.2.16/tokio/task) and runs in the background.
+//! The engine is spawned as a tokio task and runs in the background.
 //! As with spawning other tokio tasks, it must be done within the context of
 //! a tokio executor.
 //!
 //! The engine is run until an unrecoverable error occurs, or until the user
 //! sends a shutdown command.
-//!
-//! For usage examples, see the [library documentation](crate).
 
 use std::{
     collections::HashMap,
@@ -120,15 +115,10 @@ pub struct TorrentParams {
     ///
     /// This has to be unique for each torrent. If not set, or if already in
     /// use, a random port is assigned.
-    // TODO: probably use an engine wide address, but requires some
-    // rearchitecting
     pub listen_addr: Option<SocketAddr>,
 }
 
 /// The download mode.
-// TODO: remove in favor of automatic detection
-// TODO: when seeding is specified, we need to verify that the files to be
-// seeded exist and are complete
 #[derive(Debug)]
 pub enum Mode {
     Download { seeds: Vec<SocketAddr> },
@@ -179,13 +169,20 @@ struct Engine {
     conf: Conf,
 }
 
-/// A running torrent's entry in the engine.
+#[cfg(feature = "ratio")]
 struct TorrentEntry {
-    /// The torrent's command channel on which engine sends commands to torrent.
     tx: torrent::Sender,
-    /// The torrent task's join handle, used during shutdown.
+    join_handle: Option<task::JoinHandle<torrent::error::Result<()>>>,
+    info_hash: [u8; 20],
+    trackers: Vec<Tracker>,
+}
+
+#[cfg(not(feature = "ratio"))]
+struct TorrentEntry {
+    tx: torrent::Sender,
     join_handle: Option<task::JoinHandle<torrent::error::Result<()>>>,
 }
+
 
 impl Engine {
     /// Creates a new engine, spawning the disk task.
@@ -249,28 +246,29 @@ impl Engine {
             &params.metainfo,
             self.conf.engine.download_dir.clone(),
         );
-        // TODO: don't duplicate trackers if multiple torrents use the same
-        // ones (common in practice)
-        let trackers = params
+
+        // Create trackers from the metainfo URLs
+        let trackers: Vec<_> = params
             .metainfo
             .trackers
             .into_iter()
-            .map(Tracker::new)
+            .map(|url| Tracker::new(
+                url,
+                params.metainfo.info_hash,
+                self.conf.engine.client_id
+            ))
             .collect();
+
         let own_pieces = params.mode.own_pieces(storage_info.piece_count);
 
-        // create and spawn torrent
-        // TODO: For now we spawn automatically, but later when we add torrent
-        // pause/restart APIs, this will be a separate step. There should be
-        // a `start` flag in `params` that says whether to immediately spawn
-        // a new torrent (or maybe in `TorrentConf`).
+        // Create and spawn the torrent
         let (mut torrent, torrent_tx) = Torrent::new(torrent::Params {
             id,
             disk_tx: self.disk_tx.clone(),
             info_hash: params.metainfo.info_hash,
             storage_info: storage_info.clone(),
             own_pieces,
-            trackers,
+            trackers: trackers.clone(),
             client_id: self.conf.engine.client_id,
             listen_addr: params.listen_addr.unwrap_or_else(|| {
                 // the port 0 tells the kernel to assign a free port from the
@@ -281,21 +279,7 @@ impl Engine {
             alert_tx: self.alert_tx.clone(),
         });
 
-        // Allocate torrent on disk. This is an asynchronous process and we can
-        // start the torrent in the meantime.
-        //
-        // Technically we could have issues if the torrent connects to peers
-        // that send data before we manage to allocate the (empty) files on
-        // disk. However, this should be an extremely pathological case for
-        // 2 reasons:
-        // - Most torrents would be started without peers, so a torrent would
-        //   have to wait for peers from its tracker(s). This should be
-        //   a sufficiently long time to allocate torrent on disk.
-        // - Then, even if we manage to connect peers quickly, testing shows
-        //   that they don't tend to unchoke us immediately.
-        //
-        // Thus there is little chance to receive data and thus cause a disk
-        // write or disk read immediatey.
+        // Allocate torrent on disk
         self.disk_tx.send(disk::Command::NewTorrent {
             id,
             storage_info,
@@ -307,13 +291,22 @@ impl Engine {
         let join_handle =
             task::spawn(async move { torrent.start(&seeds).await });
 
-        self.torrents.insert(
-            id,
-            TorrentEntry {
-                tx: torrent_tx,
-                join_handle: Some(join_handle),
-            },
-        );
+        // Create the torrent entry based on feature flags
+        #[cfg(feature = "ratio")]
+        let entry = TorrentEntry {
+            tx: torrent_tx,
+            join_handle: Some(join_handle),
+            info_hash: params.metainfo.info_hash,
+            trackers,
+        };
+
+        #[cfg(not(feature = "ratio"))]
+        let entry = TorrentEntry {
+            tx: torrent_tx,
+            join_handle: Some(join_handle),
+        };
+
+        self.torrents.insert(id, entry);
 
         Ok(())
     }
@@ -322,36 +315,56 @@ impl Engine {
     async fn shutdown(&mut self) -> Result<()> {
         log::info!("Shutting down engine");
 
-        // tell all torrents to shut down and join their tasks
-        for torrent in self.torrents.values_mut() {
-            // the torrent task may no longer be running, so don't panic here
+        // First get stats from all torrents before shutting them down
+        #[cfg(feature = "ratio")]
+        let mut stats_map = HashMap::new();
+        #[cfg(feature = "ratio")]
+        {
+            for (id, torrent) in &self.torrents {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if torrent.tx.send(torrent::Command::GetStats { resp: tx }).is_ok() {
+                    if let Ok(stats) = rx.await {
+                        stats_map.insert(*id, stats);
+                    }
+                }
+            }
+        }
+
+        // Tell all torrents to shut down and join their tasks
+        for (id, torrent) in self.torrents.iter_mut() {
+            // Send stopped announcement to trackers before shutting down
+            #[cfg(feature = "ratio")]
+            if let Some(stats) = stats_map.get(id) {
+                for tracker in &torrent.trackers {
+                    if let Err(e) = tracker.send_stopped(*id, stats).await {
+                        log::warn!("Failed to send stopped announcement to tracker: {}", e);
+                    }
+                }
+            }
+
+            // The torrent task may no longer be running, so don't panic here
             torrent.tx.send(torrent::Command::Shutdown).ok();
         }
+
         // Then join all torrent task handles. Shutting down a torrent may take
         // a while, so join as a separate step to first initiate the shutdown of
         // all torrents.
         for torrent in self.torrents.values_mut() {
-            // FIXME: if torrent task is not running, does this panic?
-            if let Err(e) = torrent
-                .join_handle
-                .take()
-                .expect("torrent join handle missing")
-                .await
-                .expect("task error")
-            {
-                log::error!("Torrent error: {}", e);
+            if let Some(handle) = torrent.join_handle.take() {
+                if let Err(e) = handle.await.expect("task error") {
+                    log::error!("Torrent error: {}", e);
+                }
             }
         }
 
-        // send a shutdown command to disk
+        // Send a shutdown command to disk
         self.disk_tx.send(disk::Command::Shutdown)?;
-        // and join on its handle
-        self.disk_join_handle
-            .take()
-            .expect("disk join handle missing")
-            .await
-            .expect("Disk task has panicked")
-            .map_err(Error::from)?;
+        // And join on its handle
+        if let Some(handle) = self.disk_join_handle.take() {
+            handle.await
+                .expect("Disk task has panicked")
+                .map_err(Error::from)?;
+        }
 
         Ok(())
     }

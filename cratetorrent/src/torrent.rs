@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::oneshot;
 
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -65,6 +66,9 @@ pub(crate) enum Command {
     /// This command tells all active peer sessions of torrent to do the same,
     /// waits for them and announces to trackers our exit.
     Shutdown,
+    /// Get the current torrent stats (used for ratio enforcement)
+    #[cfg(feature = "ratio")]
+    GetStats { resp: oneshot::Sender<TorrentStats> },
 }
 
 /// The type returned on completing a piece.
@@ -108,8 +112,6 @@ pub(crate) struct TorrentContext {
     /// Peer sessions may be run on different threads, any of which may read and
     /// write to this map and to the pieces in the map. Thus we need a read
     /// write lock on both.
-    // TODO: Benchmark whether using the nested locking approach isn't too slow.
-    // For mvp it should do.
     pub downloads: RwLock<HashMap<PieceIndex, RwLock<PieceDownload>>>,
 
     /// The channel on which to post alerts to user.
@@ -120,6 +122,10 @@ pub(crate) struct TorrentContext {
     pub disk_tx: disk::Sender,
     /// Info about the torrent's storage (piece length, download length, etc).
     pub storage: StorageInfo,
+
+    /// Torrent configuration for access by peer sessions
+    #[cfg(any(feature = "ghostleech", feature = "ratio"))]
+    pub config: TorrentConf,
 }
 
 /// Parameters for the torrent constructor.
@@ -168,8 +174,6 @@ pub(crate) struct Torrent {
     /// This is a separate field as `Instant::now() - start_time` cannot be
     /// relied upon due to the fact that it is possible to pause a torrent, in
     /// which case we don't want to record the run time.
-    // TODO: pausing a torrent is not actually at this point, but this is done
-    // in expectation of that feature
     run_duration: Duration,
 
     /// In the last part of the download the torrent is in what's called the
@@ -227,21 +231,25 @@ impl Torrent {
             None
         };
 
+        let ctx_builder = TorrentContextBuilder {
+            id,
+            cmd_tx: cmd_tx.clone(),
+            piece_picker: Arc::new(RwLock::new(piece_picker)),
+            downloads: RwLock::new(HashMap::new()),
+            info_hash,
+            client_id,
+            alert_tx,
+            disk_tx,
+            storage: storage_info,
+            #[cfg(any(feature = "ghostleech", feature = "ratio"))]
+            config: conf.clone(),
+        };
+
         (
             Self {
                 peers: HashMap::new(),
                 available_peers: Vec::new(),
-                ctx: Arc::new(TorrentContext {
-                    id,
-                    cmd_tx: cmd_tx.clone(),
-                    piece_picker: Arc::new(RwLock::new(piece_picker)),
-                    downloads: RwLock::new(HashMap::new()),
-                    info_hash,
-                    client_id,
-                    alert_tx,
-                    disk_tx,
-                    storage: storage_info,
-                }),
+                ctx: Arc::new(ctx_builder.build()),
                 start_time: None,
                 run_duration: Duration::default(),
                 cmd_rx,
@@ -301,6 +309,24 @@ impl Torrent {
 
         Ok(())
     }
+
+    /// Get current torrent stats for ratio checking
+    #[cfg(feature = "ratio")]
+    fn get_stats(&self) -> TorrentStats {
+        TorrentStats {
+            start_time: self.start_time,
+            run_duration: self.run_duration,
+            pieces: PieceStats {
+                total: self.ctx.storage.piece_count,
+                complete: self.ctx.storage.piece_count - self.ctx.piece_picker.blocking_read().missing_piece_count(),
+                pending: self.ctx.downloads.blocking_read().len(),
+                latest_completed: None,
+            },
+            thruput: ThruputStats::from(&self.counters),
+            peers: Peers::Count(self.peers.len()),
+        }
+    }
+
 
     /// Starts the torrent and runs until an error is encountered.
     async fn run(&mut self) -> Result<()> {
@@ -380,6 +406,12 @@ impl Torrent {
                         Command::Shutdown => {
                             self.shutdown().await?;
                             break;
+                        }
+                        #[cfg(feature = "ratio")]
+                        Command::GetStats { resp } => {
+                            // Send current stats to the requester
+                            let stats = self.build_stats().await;
+                            let _ = resp.send(stats); // Ignore send errors
                         }
                     }
                 }
@@ -531,7 +563,7 @@ impl Torrent {
             // if we have an event to announce
             if event.is_some()
                 || (needed_peer_count > Some(0)
-                    && tracker.can_announce(now, self.conf.announce_interval))
+                && tracker.can_announce(now, self.conf.announce_interval))
                 || tracker.should_announce(now, self.conf.announce_interval)
             {
                 let params = Announce {
@@ -545,7 +577,18 @@ impl Torrent {
                     left,
                     ip: None,
                     event,
+
+                    // Add conditional fields based on feature flags
+                    #[cfg(feature = "spoofing")]
+                    spoof_client: self.conf.spoof_client.clone(),
+
+                    #[cfg(feature = "peer_inject")]
+                    extra_peers: self.conf.extra_peers.clone(),
+
+                    #[cfg(feature = "upload_multiplier")]
+                    show_as_seeder: false,
                 };
+
                 // TODO: We probably don't want to block the torrent event loop
                 // here waiting on the tracker response. Instead, poll the
                 // future in the event loop select call, or spawn the tracker
@@ -758,7 +801,7 @@ impl Torrent {
                         index: piece.index,
                         in_endgame: self.in_endgame,
                     })
-                    .ok();
+                        .ok();
                 }
             }
 
@@ -782,7 +825,7 @@ impl Torrent {
                     Instant::now(),
                     Some(Event::Completed),
                 )
-                .await?;
+                    .await?;
             }
         } else {
             // TODO(https://github.com/mandreyel/cratetorrent/issues/61):
@@ -826,6 +869,39 @@ impl Torrent {
         // tell trackers we're leaving
         self.announce_to_trackers(Instant::now(), Some(Event::Stopped))
             .await
+    }
+}
+
+/// Helper struct to build TorrentContext
+struct TorrentContextBuilder {
+    id: TorrentId,
+    cmd_tx: Sender,
+    piece_picker: Arc<RwLock<PiecePicker>>,
+    downloads: RwLock<HashMap<PieceIndex, RwLock<PieceDownload>>>,
+    info_hash: Sha1Hash,
+    client_id: PeerId,
+    alert_tx: AlertSender,
+    disk_tx: disk::Sender,
+    storage: StorageInfo,
+    #[cfg(any(feature = "ghostleech", feature = "ratio"))]
+    config: TorrentConf,
+}
+
+impl TorrentContextBuilder {
+    pub fn build(self) -> TorrentContext {
+        TorrentContext {
+            id: self.id,
+            cmd_tx: self.cmd_tx,
+            piece_picker: self.piece_picker,
+            downloads: self.downloads,
+            info_hash: self.info_hash,
+            client_id: self.client_id,
+            alert_tx: self.alert_tx,
+            disk_tx: self.disk_tx,
+            storage: self.storage,
+            #[cfg(any(feature = "ghostleech", feature = "ratio"))]
+            config: self.config,
+        }
     }
 }
 
@@ -952,9 +1028,9 @@ impl TrackerEntry {
         if let Some(last_announce_time) = self.last_announce_time {
             let min_next_announce_time = last_announce_time
                 + self
-                    .min_interval
-                    .or(self.min_interval)
-                    .unwrap_or(default_announce_interval);
+                .min_interval
+                .or(self.min_interval)
+                .unwrap_or(default_announce_interval);
             t > min_next_announce_time
         } else {
             true

@@ -498,6 +498,8 @@ impl Torrent {
 
         Ok(())
     }
+    
+    
 }
 
 // TODO(https://github.com/mandreyel/cratetorrent/issues/22):

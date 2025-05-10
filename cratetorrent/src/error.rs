@@ -38,6 +38,9 @@ pub enum Error {
         addr: SocketAddr,
         error: PeerError,
     },
+    /// A miscellaneous error with a custom message.
+    /// Used for various custom errors like ratio enforcement.
+    Misc(String),
 }
 
 impl fmt::Display for Error {
@@ -57,6 +60,7 @@ impl fmt::Display for Error {
             Peer { id, addr, error } => {
                 write!(fmt, "torrent {} peer {} error: {}", id, addr, error)
             }
+            Misc(msg) => write!(fmt, "{}", msg),
         }
     }
 }
@@ -82,5 +86,12 @@ impl From<IoError> for Error {
 impl<T> From<SendError<T>> for Error {
     fn from(_: SendError<T>) -> Self {
         Self::Channel
+    }
+}
+
+// Helper method for engine to create Misc errors
+impl Error {
+    pub fn Other(msg: String) -> Self {
+        Self::Misc(msg)
     }
 }

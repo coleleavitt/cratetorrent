@@ -1,106 +1,138 @@
-//! This module defines types used to configure the engine and its parts.
+//! Global and per‐torrent configuration, with optional mod flags.
 
 use std::{path::PathBuf, time::Duration};
 
+// Keep the first import conditional
+#[cfg(feature = "spoofing")]
 use crate::PeerId;
 
-/// The default cratetorrent client id.
+// Import for all builds (remove the duplicate below)
+#[cfg(not(feature = "spoofing"))]
+use crate::PeerId;
+
+#[cfg(feature = "peer_inject")]
+use std::net::SocketAddr;
+
+/// The default cratetorrent client id (for spoofing).
+#[cfg(feature = "spoofing")]
 pub const CRATETORRENT_CLIENT_ID: &PeerId = b"cbt-0000000000000000";
 
-/// The global configuration for the torrent engine and all its parts.
+/// Top‐level configuration for the engine.
 #[derive(Clone, Debug)]
 pub struct Conf {
     pub engine: EngineConf,
     pub torrent: TorrentConf,
+    #[cfg(any(feature = "ghostleech", feature = "ratio"))]
+    pub mod_conf: ExtremeModConf,
 }
 
 impl Conf {
-    /// Returns the torrent configuration with reasonable defaults, except for
-    /// the download directory, as it is not sensible to guess that for the
-    /// user. It uses the default cratetorrent client id,
-    /// [`CRATETORRENT_CLIENT_ID`].
     pub fn new(download_dir: impl Into<PathBuf>) -> Self {
         Self {
             engine: EngineConf {
+                #[cfg(feature = "spoofing")]
                 client_id: *CRATETORRENT_CLIENT_ID,
+                #[cfg(not(feature = "spoofing"))]
+                client_id: Default::default(),
                 download_dir: download_dir.into(),
             },
             torrent: TorrentConf::default(),
+            #[cfg(any(feature = "ghostleech", feature = "ratio"))]
+            mod_conf: ExtremeModConf::default(),
         }
     }
 }
 
-/// Configuration related to the engine itself.
+/// Engine‐wide settings.
 #[derive(Clone, Debug)]
 pub struct EngineConf {
-    /// The ID of the client to announce to trackers and other peers.
+    /// The 20‐byte peer_id sent in tracker announces.
     pub client_id: PeerId,
-    /// The directory in which a torrent's files are placed upon download and
-    /// from which they are seeded.
+    /// Directory for downloads and seeds.
     pub download_dir: PathBuf,
 }
 
-/// Configuration for a torrent.
-///
-/// The engine will have a default instance of this applied to all torrents by
-/// default, but individual torrents may override this configuration.
+/// Per‐torrent settings.
 #[derive(Clone, Debug)]
 pub struct TorrentConf {
-    /// The minimum number of peers we want to keep in torrent at all times.
-    /// This will be configurable later.
     pub min_requested_peer_count: usize,
-
-    /// The max number of connected peers the torrent should have.
     pub max_connected_peer_count: usize,
-
-    /// If the tracker doesn't provide a minimum announce interval, we default
-    /// to announcing every 30 seconds.
     pub announce_interval: Duration,
-
-    /// After this many attempts, the torrent stops announcing to a tracker.
     pub tracker_error_threshold: usize,
 
-    /// Specifies which optional alerts to send, besides the default periodic
-    /// stats update.
+    #[cfg(feature = "spoofing")]
+    /// Append `&client=<string>` to tracker announces.
+    pub spoof_client: Option<String>,
+
+    #[cfg(feature = "peer_inject")]
+    /// Extra peers to append to each tracker response.
+    pub extra_peers: Vec<SocketAddr>,
+
+    #[cfg(feature = "ghostleech")]
+    /// Never honor peer REQUESTs, always choke.
+    pub ghost_leech: bool,
+
+    #[cfg(feature = "ratio")]
+    /// Stop uploading when uploaded/downloaded ≥ this ratio.
+    pub max_ratio: Option<f64>,
+
+    #[cfg(feature = "upload_multiplier")]
+    /// Multiply reported upload stats by this factor
+    pub upload_multiplier: Option<f64>,
+
     pub alerts: TorrentAlertConf,
 }
 
-/// Configuration of a torrent's optional alerts.
-///
-/// By default, all optional alerts are turned off. This is because some of
-/// these alerts may have overhead that shouldn't be paid when the alerts are
-/// not used.
-#[derive(Clone, Debug, Default)]
-pub struct TorrentAlertConf {
-    /// Receive the pieces that were completed each round.
-    ///
-    /// This has minor overhead and so it may be enabled. For full optimization,
-    /// however, it is only enabled when either the pieces or individual file
-    /// completions are needed.
-    pub completed_pieces: bool,
-    /// Receive aggregate statistics about the torrent's peers.
-    ///
-    /// This may be relatively expensive. It is suggested to only turn it on
-    /// when it is specifically needed, e.g. when the UI is showing the peers of
-    /// a torrent.
-    pub peers: bool,
-}
 
 impl Default for TorrentConf {
     fn default() -> Self {
         Self {
-            // We always request at least 10 peers as anything less is a waste
-            // of network round trip and it allows us to buffer up a bit more
-            // than needed.
             min_requested_peer_count: 10,
-            // This value is mostly picked for performance while keeping in mind
-            // not to overwhelm the host.
             max_connected_peer_count: 50,
-            // needs teting
             announce_interval: Duration::from_secs(60 * 60),
-            // needs testing
             tracker_error_threshold: 15,
+            #[cfg(feature = "spoofing")]
+            spoof_client: None,
+            #[cfg(feature = "peer_inject")]
+            extra_peers: Vec::new(),
+            #[cfg(feature = "ghostleech")]
+            ghost_leech: false,
+            #[cfg(feature = "ratio")]
+            max_ratio: None,
+            #[cfg(feature = "upload_multiplier")]
+            upload_multiplier: None,
             alerts: Default::default(),
+        }
+    }
+}
+
+
+/// Optional engine alerts per torrent.
+#[derive(Clone, Debug, Default)]
+pub struct TorrentAlertConf {
+    pub completed_pieces: bool,
+    pub peers: bool,
+}
+
+/// "Extreme mod" flags: ghost‐leech and upload‐ratio guard.
+#[derive(Clone, Debug)]
+pub struct ExtremeModConf {
+    /// Never honor peer REQUESTs, always choke.
+    #[cfg(feature = "ghostleech")]
+    pub ghost_leech: bool,
+
+    /// Stop uploading when uploaded/downloaded ≥ this ratio.
+    #[cfg(feature = "ratio")]
+    pub max_ratio: Option<f64>,
+}
+
+impl Default for ExtremeModConf {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "ghostleech")]
+            ghost_leech: false,
+            #[cfg(feature = "ratio")]
+            max_ratio: None,
         }
     }
 }
