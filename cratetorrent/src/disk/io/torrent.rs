@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    // Add NonZeroUsize to imports if preferred, or use full path std::num::NonZeroUsize
+    num::NonZeroUsize,
     sync::{
         self,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -211,7 +213,9 @@ impl Torrent {
             thread_ctx: Arc::new(ThreadContext {
                 tx: torrent_tx,
                 read_cache: sync::Mutex::new(LruCache::new(
-                    READ_CACHE_UPPER_BOUND,
+                    // Convert usize to NonZeroUsize
+                    NonZeroUsize::new(READ_CACHE_UPPER_BOUND)
+                        .expect("READ_CACHE_UPPER_BOUND must be non-zero"),
                 )),
                 files,
                 stats: Stats::default(),

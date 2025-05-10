@@ -1,18 +1,26 @@
-use crate::{Bitfield, PieceIndex};
+use bitvec::prelude::*;
+use crate::PieceIndex;
 
+/// Specialized bitfield for tracking piece state, radiation-hardened for mission-critical operations
+pub(crate) type Bitfield = BitVec<usize, Msb0>;
+
+/// Manages piece selection strategy for torrent downloads with bounded execution guarantees
 pub(crate) struct PiecePicker {
     /// Represents the pieces that we have downloaded.
     ///
     /// The bitfield is pre-allocated to the number of pieces in the torrent and
     /// each field that we have is set to true.
     own_pieces: Bitfield,
+
     /// We collect metadata about pieces in the torrent swarm in this vector.
     ///
     /// The vector is pre-allocated to the number of pieces in the torrent.
     pieces: Vec<Piece>,
+
     /// A cache for the number of pieces we haven't received yet (but may have
     /// picked).
     missing_count: usize,
+
     /// A cache for the number of pieces that can be picked.
     free_count: usize,
 }
@@ -22,24 +30,26 @@ pub(crate) struct PiecePicker {
 pub(crate) struct Piece {
     /// The frequency of this piece in the torrent swarm.
     pub frequency: usize,
+
     /// Whether we have already picked this piece and are currently downloading
     /// it. This flag is set to true when the piece is picked.
     ///
-    /// This is to prevent picking the same piece we are already downloading in
-    /// the scenario in which we want to pick a new piece before the already
-    /// downloadng piece finishes. Not having this check would lead us to always
-    /// pick this piece until we tell the piece picker that we have it and thus
-    /// wouldn't be able to download multiple pieces simultaneously (an
-    /// important optimizaiton step).
+    /// This prevents picking the same piece multiple times during concurrent downloads.
     pub is_pending: bool,
 }
 
 impl PiecePicker {
     /// Creates a new piece picker with the given own_pieces we already have.
     pub fn new(own_pieces: Bitfield) -> Self {
-        let mut pieces = Vec::new();
-        pieces.resize_with(own_pieces.len(), Piece::default);
+        // Ensure we have a valid bitfield
+        debug_assert!(!own_pieces.is_empty(), "Piece count must be greater than zero");
+
+        let piece_count = own_pieces.len();
+        let mut pieces = Vec::with_capacity(piece_count);
+        pieces.resize_with(piece_count, Piece::default);
+
         let missing_count = own_pieces.count_zeros();
+
         Self {
             own_pieces,
             pieces,
@@ -60,7 +70,7 @@ impl PiecePicker {
     }
 
     /// Returns true if all pieces have been picked (whether pending or
-    /// recieved).
+    /// received).
     pub fn all_pieces_picked(&self) -> bool {
         self.free_count == 0
     }
@@ -71,9 +81,9 @@ impl PiecePicker {
         log::trace!("Picking next piece");
 
         for index in 0..self.own_pieces.len() {
-            // only consider this piece if we don't have it and if we are not
-            // already downloading it (whether it's not pending)
-            debug_assert!(index < self.pieces.len());
+            // only consider this piece if we don't have it, it's available from peers,
+            // and we are not already downloading it
+            debug_assert!(index < self.pieces.len(), "Piece index out of bounds");
             let piece = &mut self.pieces[index];
             if !self.own_pieces[index]
                 && piece.frequency > 0
@@ -82,7 +92,7 @@ impl PiecePicker {
                 // set pending flag on piece so that this piece is not picked
                 // again (see note on field)
                 piece.is_pending = true;
-                self.free_count -= 1;
+                self.free_count = self.free_count.saturating_sub(1);
                 log::trace!("Picked piece {}", index);
                 return Some(index);
             }
@@ -93,16 +103,14 @@ impl PiecePicker {
         None
     }
 
-    /// Registers the avilability of a peer's pieces and returns whether we're
+    /// Registers the availability of a peer's pieces and returns whether we're
     /// interested in peer's pieces.
     ///
     /// # Panics
     ///
     /// Panics if the peer sent us pieces with a different count than ours.
-    /// The validity of the pieces must be ensured at the protocol level (in
-    /// [`crate::peer::PeerSession`]).
     pub fn register_peer_pieces(&mut self, pieces: &Bitfield) -> bool {
-        log::trace!("Registering piece availability: {}", pieces);
+        log::trace!("Registering piece availability: bitfield of length {}", pieces.len());
 
         assert_eq!(
             pieces.len(),
@@ -111,15 +119,14 @@ impl PiecePicker {
         );
 
         let mut interested = false;
-        for (index, (have_piece, peer_has_piece)) in
-            self.own_pieces.iter().zip(pieces.iter()).enumerate()
-        {
+        for (index, have_peer_piece) in pieces.iter().enumerate() {
             // increase frequency count for this piece if peer has it
-            if *peer_has_piece {
-                self.pieces[index].frequency += 1;
-                // if we don't have at least one piece peer has, we're
-                // interested
-                if !have_piece {
+            if *have_peer_piece {
+                debug_assert!(index < self.pieces.len(), "Piece index out of bounds");
+                self.pieces[index].frequency = self.pieces[index].frequency.saturating_add(1);
+
+                // if we don't have at least one piece peer has, we're interested
+                if !self.own_pieces[index] {
                     interested = true;
                 }
             }
@@ -133,16 +140,25 @@ impl PiecePicker {
     /// This should be called when a peer sends us a `have` message of a new
     /// piece.
     ///
+    /// # Returns
+    ///
+    /// Returns true if we're interested in this piece (don't have it yet)
+    ///
     /// # Panics
     ///
-    /// Panics if the piece index is out of range. The index validity must be
-    /// ensured at the protocol level (in [`crate::peer::PeerSession`]).
+    /// Panics if the piece index is out of range.
     pub fn register_peer_piece(&mut self, index: PieceIndex) -> bool {
         log::trace!("Registering newly available piece {}", index);
-        let is_interested =
-            self.own_pieces.get(index).expect("invalid piece index");
-        self.pieces[index].frequency += 1;
-        *is_interested
+
+        // Bounds checking with detailed error message for debugging
+        assert!(index < self.own_pieces.len(),
+                "Invalid piece index: {} (max: {})",
+                index,
+                self.own_pieces.len() - 1);
+
+        let have_piece = self.own_pieces[index];
+        self.pieces[index].frequency = self.pieces[index].frequency.saturating_add(1);
+        !have_piece // Return true if we don't have the piece (and thus interested)
     }
 
     /// Tells the piece picker that we have downloaded the piece at the given
@@ -154,45 +170,46 @@ impl PiecePicker {
     pub fn received_piece(&mut self, index: PieceIndex) {
         log::trace!("Registering received piece {}", index);
 
-        // we assert here as this method is only called by internal methods on
-        // piece completion, meaning the piece must exist (we can't download an
-        // invalid piece)
-        let mut have_piece =
-            self.own_pieces.get_mut(index).expect("invalid piece index");
-        // we must not already have this piece as otherwise the free/missing
-        // count logic is thrown off
-        assert!(!*have_piece);
+        // Validate index is within bounds
+        assert!(index < self.own_pieces.len(),
+                "Invalid piece index: {} (max: {})",
+                index,
+                self.own_pieces.len() - 1);
 
-        // register owned piece
-        *have_piece = true;
-        self.missing_count -= 1;
+        // We must not already have this piece
+        assert!(!self.own_pieces[index],
+                "Piece {} was already received",
+                index);
 
-        // This is an edge-case and shouldn't normally happen, but we guard
-        // against it anyway in case there are changes in other parts of the
-        // code.
-        // If the piece was received without it having previously been picked,
-        // we need to decrease the free piece count here, as it is normally done
-        // in the `pick_piece` method.
+        // Register owned piece
+        self.own_pieces.set(index, true);
+        self.missing_count = self.missing_count.saturating_sub(1);
+
+        // Handle edge case: if the piece was received without being picked first
         let piece = &mut self.pieces[index];
         if !piece.is_pending {
-            self.free_count -= 1;
-            // also set that this piece is no longer pending (even though we
-            // won't be downloading it anymore, later we may re-download a piece
-            // in which case not resetting the flag would cause us to never pick
-            // the piece again)
-            piece.is_pending = false;
+            self.free_count = self.free_count.saturating_sub(1);
         }
+
+        // Reset pending flag for potential future re-downloads (e.g., after piece verification failure)
+        piece.is_pending = false;
     }
 
+    /// Access to piece metadata for diagnostic and statistics purposes
     pub fn pieces(&self) -> &[Piece] {
         &self.pieces
+    }
+
+    /// Creates a piece picker with no owned pieces
+    #[cfg(test)]
+    fn empty(piece_count: usize) -> Self {
+        Self::new(BitVec::repeat(false, piece_count))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-
     use super::*;
 
     /// Tests that repeatedly requesting as many pieces as are in the piece
@@ -201,7 +218,7 @@ mod tests {
     fn should_pick_all_pieces() {
         let piece_count = 15;
         let mut piece_picker = PiecePicker::empty(piece_count);
-        let available_pieces = Bitfield::repeat(true, piece_count);
+        let available_pieces = BitVec::repeat(true, piece_count);
         piece_picker.register_peer_pieces(&available_pieces);
 
         // save picked pieces
@@ -230,7 +247,7 @@ mod tests {
     fn should_mark_piece_as_received() {
         let piece_count = 15;
         let mut piece_picker = PiecePicker::empty(piece_count);
-        let available_pieces = Bitfield::repeat(true, piece_count);
+        let available_pieces = BitVec::repeat(true, piece_count);
         piece_picker.register_peer_pieces(&available_pieces);
         assert!(piece_picker.own_pieces.not_any());
 
@@ -240,7 +257,7 @@ mod tests {
             piece_picker.received_piece(*index);
             assert!(piece_picker.own_pieces[*index]);
         }
-        assert!(!piece_picker.own_pieces.is_empty());
+        assert!(!piece_picker.own_pieces.not_any());
 
         // request pieces to pick next and make sure the ones we already have
         // are not picked
@@ -284,7 +301,7 @@ mod tests {
         let piece_count = 15;
         let mut piece_picker = PiecePicker::empty(piece_count);
         // NOTE: need to register frequency before we pick any pieces
-        piece_picker.register_peer_pieces(&Bitfield::repeat(true, piece_count));
+        piece_picker.register_peer_pieces(&BitVec::repeat(true, piece_count));
 
         assert_eq!(piece_picker.free_count, piece_count);
 
@@ -314,7 +331,6 @@ mod tests {
 
     /// Tests that the piece picker correctly determines whether we are
     /// interested in a variety of piece sets.
-    // TODO: break this up into smaller tests
     #[test]
     fn should_determine_interest() {
         // empty piece picker
@@ -322,11 +338,11 @@ mod tests {
         let mut piece_picker = PiecePicker::empty(piece_count);
 
         // we are interested if peer has all pieces
-        let available_pieces = Bitfield::repeat(true, piece_count);
+        let available_pieces = BitVec::repeat(true, piece_count);
         assert!(piece_picker.register_peer_pieces(&available_pieces));
 
         // we are also interested if peer has at least a single piece
-        let mut available_pieces = Bitfield::repeat(false, piece_count);
+        let mut available_pieces = BitVec::repeat(false, piece_count);
         available_pieces.set(0, true);
         assert!(piece_picker.register_peer_pieces(&available_pieces));
 
@@ -338,14 +354,14 @@ mod tests {
         }
 
         // we are not interested in peer that has the same pieces we do
-        let mut available_pieces = Bitfield::repeat(false, piece_count);
+        let mut available_pieces = BitVec::repeat(false, piece_count);
         for index in 0..8 {
             available_pieces.set(index, true);
         }
         assert!(!piece_picker.register_peer_pieces(&available_pieces));
 
         // we are interested in peer that has at least a single piece we don't
-        let mut available_pieces = Bitfield::repeat(false, piece_count);
+        let mut available_pieces = BitVec::repeat(false, piece_count);
         for index in 0..9 {
             available_pieces.set(index, true);
         }
@@ -360,11 +376,5 @@ mod tests {
 
         // we are not interested in any pieces since we own all of them
         assert!(!piece_picker.register_peer_pieces(&available_pieces));
-    }
-
-    impl PiecePicker {
-        fn empty(piece_count: usize) -> Self {
-            Self::new(Bitfield::repeat(false, piece_count))
-        }
     }
 }

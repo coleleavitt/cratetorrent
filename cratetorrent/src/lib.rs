@@ -213,8 +213,7 @@ pub type Sha1Hash = [u8; 20];
 /// mean that we have pieces 0, 1, and 7). A truthy boolean value of a piece's
 /// position in this vector means that the peer has the piece, while a falsy
 /// value means it doesn't have the piece.
-pub type Bitfield = BitVec<Msb0, u8>;
-
+pub type Bitfield = bitvec::vec::BitVec<usize, bitvec::order::Msb0>;
 /// Whether a torrent or peer connection is a seed or a leech.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Side {
@@ -328,6 +327,7 @@ impl Block {
 /// a cache.
 #[derive(Debug, PartialEq)]
 #[cfg_attr(test, derive(Clone))]
+#[derive(Clone)]
 pub(crate) enum BlockData {
     Owned(Vec<u8>),
     Cached(CachedBlock),

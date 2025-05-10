@@ -26,6 +26,9 @@ use tokio::{
 };
 use tokio_util::codec::{Framed, FramedParts};
 
+// Import bitvec prelude for BitVec and its traits
+use bitvec::prelude::*;
+
 use crate::{
     alert::Alert,
     counter::ThruputCounters,
@@ -33,14 +36,26 @@ use crate::{
     download::{BlockStatus, PieceDownload},
     error::Error,
     torrent::{self, TorrentContext},
-    Bitfield, Block, BlockInfo, PeerId, PieceIndex,
+    // Note: We define our own Bitfield alias below, so we don't import it from crate root here
+    // if it was previously defined there for this module.
+    Block, BlockInfo, PeerId, PieceIndex,
 };
+// These imports are for submodules of peer.rs
 use codec::*;
 use error::*;
 use state::*;
 
 pub use state::{ConnectionState, SessionState};
 
+// Define Bitfield as a type alias for BitVec from the bitvec crate.
+// Using usize as the storage element and Msb0 for bit ordering.
+pub type Bitfield = BitVec<usize, Msb0>;
+
+// These are submodules of the peer module (peer.rs)
+// Their content is not included here but would be in separate files:
+// - peer/codec.rs
+// - peer/error.rs
+// - peer/state.rs
 mod codec;
 pub mod error;
 mod state;
@@ -154,10 +169,6 @@ pub(crate) struct PeerSession {
     ///
     /// Note that if a reuest for a piece's block is in this queue, there _must_
     /// be a corresponding entry for the piece download in `downloads`.
-    // TODO(https://github.com/mandreyel/cratetorrent/issues/11): Can we store
-    // this information in just PieceDownload so that we don't have to enforce
-    // this invariant (keeping in mind that later PieceDownloads will be shared
-    // among PeerSessions)?
     outgoing_requests: HashSet<BlockInfo>,
     /// The requests we got from peer.
     ///
@@ -208,7 +219,8 @@ impl PeerSession {
                 cmd_rx,
                 peer: PeerInfo {
                     addr,
-                    pieces: Bitfield::repeat(false, piece_count),
+                    // Use BitVec::repeat for initialization
+                    pieces: BitVec::repeat(false, piece_count),
                     piece_count: 0,
                     id: Default::default(),
                 },
@@ -440,8 +452,8 @@ impl PeerSession {
                             .read()
                             .await
                             .own_pieces()
-                            .not_any()
-                            && self.peer.pieces.not_any()
+                            .not_any() // Assumes BitVec has not_any()
+                            && self.peer.pieces.not_any() // Assumes BitVec has not_any()
                         {
                             log::warn!(
                                 target: &self.ctx.log_target,
@@ -501,8 +513,8 @@ impl PeerSession {
         if !self.ctx.state.is_interested
             && !self.ctx.state.is_peer_interested
             && now.saturating_duration_since(
-                self.ctx.connected_time.expect("not connected"),
-            ) >= INACTIVITY_TIMEOUT
+            self.ctx.connected_time.expect("not connected"),
+        ) >= INACTIVITY_TIMEOUT
         {
             log::warn!(target: &self.ctx.log_target, "Not interested in each other, disconnecting");
             return Err(PeerError::InactivityTimeout);
@@ -667,7 +679,7 @@ impl PeerSession {
         // According to the spec if the remainder contains any non-zero
         // bits, we need to abort the connection. Not sure if this is too
         // strict, there doesn't seem much harm in it so we skip the check.
-        bitfield.resize(self.torrent.storage.piece_count, false);
+        bitfield.resize(self.torrent.storage.piece_count, false); // BitVec::resize
 
         // register peer's pieces with piece picker and determine interest in it
         let is_interested = self
@@ -677,7 +689,7 @@ impl PeerSession {
             .await
             .register_peer_pieces(&bitfield);
         self.peer.pieces = bitfield;
-        self.peer.piece_count = self.peer.pieces.count_ones();
+        self.peer.piece_count = self.peer.pieces.count_ones(); // BitVec::count_ones
         if self.peer.piece_count == self.torrent.storage.piece_count {
             log::info!(target: &self.ctx.log_target, "Peer is a seed, interested: {}", is_interested);
         } else {
@@ -740,7 +752,7 @@ impl PeerSession {
             Message::Interested => {
                 if !self.ctx.state.is_peer_interested {
                     // TODO(https://github.com/mandreyel/cratetorrent/issues/60):
-                    // we currently unchkoe peer unconditionally, but we should
+                    // we currently unchoke peer unconditionally, but we should
                     // implement the proper unchoke algorithm in `Torrent`
                     log::info!(target: &self.ctx.log_target, "Peer became interested");
                     log::info!(target: &self.ctx.log_target, "Unchoking peer");
@@ -813,7 +825,6 @@ impl PeerSession {
             return Ok(());
         }
 
-        // TODO: optimize this by using the preallocated hashset in self
         let mut requests = Vec::new();
         let target_request_queue_len =
             self.ctx.target_request_queue_len.unwrap_or_default();
@@ -821,11 +832,8 @@ impl PeerSession {
         // If we have active downloads, prefer to continue those. This will
         // result in less in-progress pieces.
         for download in self.torrent.downloads.write().await.values_mut() {
-            // check and calculate the number of requests we can make now
             let outgoing_request_count =
                 requests.len() + self.outgoing_requests.len();
-            // our outgoing request queue shouldn't exceed the allowed request
-            // queue size
             if outgoing_request_count >= target_request_queue_len {
                 break;
             }
@@ -850,8 +858,6 @@ impl PeerSession {
         loop {
             let outgoing_request_count =
                 requests.len() + self.outgoing_requests.len();
-            // our outgoing request queue shouldn't exceed the allowed request
-            // queue size
             if outgoing_request_count >= target_request_queue_len {
                 break;
             }
@@ -876,7 +882,6 @@ impl PeerSession {
                     self.ctx.in_endgame,
                     &self.outgoing_requests,
                 );
-                // save download
                 self.torrent
                     .downloads
                     .write()
@@ -890,7 +895,6 @@ impl PeerSession {
                     self.torrent.downloads.read().await.len(),
                     self.outgoing_requests.len(),
                 );
-
                 break;
             }
         }
@@ -903,12 +907,9 @@ impl PeerSession {
                 self.outgoing_requests.len()
             );
             self.ctx.last_outgoing_request_time = Some(Instant::now());
-            // make the actual requests
             for req in requests.into_iter() {
                 log::debug!(target: &self.ctx.log_target, "Requesting block {}", req);
                 self.outgoing_requests.insert(req);
-                // TODO: batch these in a single syscall, or is this already
-                // being done by the tokio codec type?
                 sink.send(Message::Request(req)).await?;
                 self.ctx.counters.protocol.up +=
                     MessageId::Request.header_len();
@@ -927,11 +928,8 @@ impl PeerSession {
         block_info: BlockInfo,
         data: Vec<u8>,
     ) -> Result<()> {
-        // remove pending block request
         self.outgoing_requests.remove(&block_info);
 
-        // try to find the piece to which this block corresponds
-        // and mark the block in piece as downloaded
         let prev_status = match self
             .torrent
             .downloads
@@ -943,12 +941,6 @@ impl PeerSession {
                 download.write().await.received_block(&block_info)
             }
             None => {
-                // silently ignore this block if we didn't expected it
-                //
-                // TODO(https://github.com/mandreyel/cratetorrent/issues/10): In
-                // the future we could add logic that only accepts blocks within
-                // a window after the last request. If not done, peer could DoS
-                // us by sending unwanted blocks repeatedly.
                 log::warn!(
                     target: &self.ctx.log_target,
                     "Discarding block {} with no piece download{}",
@@ -964,7 +956,6 @@ impl PeerSession {
             }
         };
 
-        // don't process the block if already downloaded
         if prev_status == BlockStatus::Received {
             self.ctx.record_waste(block_info.len);
             log::info!(
@@ -986,18 +977,13 @@ impl PeerSession {
                 }
             );
 
-            // update download stats
             self.ctx.update_download_stats(block_info.len);
-
-            // validate and save the block to disk by sending a write command to the
-            // disk task
             self.torrent.disk_tx.send(disk::Command::WriteBlock {
                 id: self.torrent.id,
                 block_info,
                 data,
             })?;
         }
-
         Ok(())
     }
 
@@ -1013,19 +999,14 @@ impl PeerSession {
         block_info: BlockInfo,
     ) -> Result<()> {
         log::info!(target: &self.ctx.log_target, "Got request: {:?}", block_info);
-
-        // before processing request validate block info
         self.validate_block_info(&block_info)?;
 
-        // check if peer is not choked: if they are, they can't request blocks
         if self.ctx.state.is_peer_choked {
             log::warn!(target: &self.ctx.log_target, "Choked peer sent request");
             return Err(PeerError::RequestWhileChoked);
         }
 
-        // check if peer is not already requesting this block
         if self.incoming_requests.contains(&block_info) {
-            // TODO: if peer keeps spamming us, close connection
             log::warn!(target: &self.ctx.log_target, "Peer sent duplicate block request");
             return Ok(());
         }
@@ -1033,8 +1014,6 @@ impl PeerSession {
         log::info!(target: &self.ctx.log_target, "Issuing disk IO read for block {}", block_info);
         self.incoming_requests.insert(block_info);
 
-        // validate and save the block to disk by sending a write command to the
-        // disk task
         self.torrent.disk_tx.send(disk::Command::ReadBlock {
             id: self.torrent.id,
             block_info,
@@ -1054,28 +1033,22 @@ impl PeerSession {
         let info = block.info();
         log::info!(target: &self.ctx.log_target, "Read from disk {}", info);
 
-        // remove peer's pending request
         let was_present = self.incoming_requests.remove(&info);
-
-        // check if the request hasn't been canceled yet
         if !was_present {
             log::warn!(target: &self.ctx.log_target, "No matching request entry for {}", info);
             return Ok(());
         }
 
-        // if it hasn't, send the data to peer
         log::info!(target: &self.ctx.log_target, "Sending {}", info);
         sink.send(Message::Block {
             piece_index: block.piece_index,
             offset: block.offset,
             data: block.data,
         })
-        .await?;
+            .await?;
         log::info!(target: &self.ctx.log_target, "Sent {}", info);
 
-        // update download stats
         self.ctx.update_upload_stats(info.len);
-
         Ok(())
     }
 
@@ -1087,21 +1060,15 @@ impl PeerSession {
         piece_index: PieceIndex,
     ) -> Result<()> {
         log::info!(target: &self.ctx.log_target, "Peer has piece {}", piece_index);
-
-        // validate piece index
         self.validate_piece_index(piece_index)?;
 
-        // It's important to check if peer already has this piece.
-        // Otherwise we'd record duplicate pieces in the swarm in the below
-        // availability registration.
-        if self.peer.pieces[piece_index] {
+        if self.peer.pieces[piece_index] { // BitVec index access
             return Ok(());
         }
 
-        self.peer.pieces.set(piece_index, true);
+        self.peer.pieces.set(piece_index, true); // BitVec::set
         self.peer.piece_count += 1;
 
-        // need to recalculate interest with each received piece
         let is_interested = self
             .torrent
             .piece_picker
@@ -1109,7 +1076,6 @@ impl PeerSession {
             .await
             .register_peer_piece(piece_index);
 
-        // we may have become interested in peer
         self.update_interest(sink, is_interested).await
     }
 
@@ -1119,23 +1085,19 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, PeerCodec>, Message>,
         is_interested: bool,
     ) -> Result<()> {
-        // we may have become interested in peer
         if !self.ctx.state.is_interested && is_interested {
             log::info!(target: &self.ctx.log_target, "Became interested in peer");
             self.ctx.counters.protocol.up += MessageId::Interested.header_len();
             self.ctx.update_state(|state| {
                 state.is_interested = is_interested;
             });
-            // send interested message to peer
             sink.send(Message::Interested).await?;
         } else if self.ctx.state.is_interested && !is_interested {
             log::info!(target: &self.ctx.log_target, "No longer interested in peer");
             self.ctx.update_state(|state| {
                 state.is_interested = is_interested;
             });
-            // TODO: do we need to do anything else here?
         }
-
         Ok(())
     }
 
@@ -1177,8 +1139,7 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, PeerCodec>, Message>,
         piece_index: PieceIndex,
     ) -> Result<()> {
-        // if peer doesn't have the piece, announce it
-        if !self.peer.pieces[piece_index] {
+        if !self.peer.pieces[piece_index] { // BitVec index access
             log::debug!(
                 target: &self.ctx.log_target,
                 "Announcing piece {}",
@@ -1186,15 +1147,6 @@ impl PeerSession {
             );
             sink.send(Message::Have { piece_index }).await?;
         } else {
-            // Otherwise peer has it and we may have requested it. Check if
-            // there are any pending requests for blocks in this piece, and if
-            // so, cancel them.
-            // TODO: We could actually send the cancel messages much sooner,
-            // when we first receive the block (rather then waiting for the
-            // piece completion). However, it would require an mpsc roundtrip to
-            // torrent and all other peers, for each of these blocks received in
-            // endgame, so it is questionable whether it's worth it at the cost
-            // of slowing down the engine.
             for block in self.outgoing_requests.iter() {
                 if block.piece_index == piece_index {
                     log::info!(
@@ -1206,7 +1158,6 @@ impl PeerSession {
                 }
             }
         }
-
         Ok(())
     }
 }

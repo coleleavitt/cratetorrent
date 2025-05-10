@@ -4,3 +4,7 @@ scratch*
 tests/assets
 flamegraph*
 perf*
+!/cratetorrent/Cargo.toml
+!/cratetorrent/Cargo.toml
+!/cratetorrent/Cargo.toml
+!/cratetorrent-cli/Cargo.toml
