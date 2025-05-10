@@ -144,7 +144,6 @@ use std::{
     sync::Arc,
 };
 
-use bitvec::prelude::{BitVec, Msb0};
 
 pub use storage_info::FileInfo;
 
