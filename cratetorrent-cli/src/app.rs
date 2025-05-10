@@ -41,7 +41,8 @@ impl App {
         let metainfo = Metainfo::from_bytes(&metainfo)?;
         let info_hash = hex::encode(&metainfo.info_hash);
         let piece_count = metainfo.piece_count();
-        let download_len = metainfo.download_len();
+        // TODO: implement a more efficient way to store this
+        // let download_len = metainfo.download_len();
         let is_seed = matches!(args.mode, Mode::Seed);
 
         let storage = StorageInfo::new(&metainfo, self.download_dir.clone());
@@ -86,7 +87,8 @@ impl App {
             name: metainfo.name,
             info_hash,
             piece_len: metainfo.piece_len,
-            download_len,
+            // TODO: implement a more efficient way to store this
+            //download_len,
             storage,
 
             run_duration: Default::default(),
@@ -95,7 +97,8 @@ impl App {
             peers: Default::default(),
             protocol: Default::default(),
             payload: Default::default(),
-            wasted_payload_count: Default::default(),
+            // TODO: implement a more efficient way to store this
+            // wasted_payload_count: Default::default(),
         };
         self.torrents.insert(torrent_id, torrent);
 
@@ -208,7 +211,8 @@ pub struct Torrent {
     pub name: String,
     pub info_hash: String,
     pub piece_len: u32,
-    pub download_len: u64,
+    // TODO: implement a more efficient way to store this
+    // pub download_len: u64, 
     pub storage: StorageInfo,
 
     // dynamic info
@@ -220,7 +224,8 @@ pub struct Torrent {
 
     pub protocol: ChannelHistory,
     pub payload: ChannelHistory,
-    pub wasted_payload_count: u64,
+    // TODO: implement a more efficient way to store this
+    // pub wasted_payload_count: u64,
 }
 
 impl Torrent {

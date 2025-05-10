@@ -324,13 +324,13 @@ impl Block {
 ///
 /// A block may be just a normal byte buffer, or it may be a reference into
 /// a cache.
-#[derive(Debug, PartialEq)]
-#[cfg_attr(test, derive(Clone))]
-#[derive(Clone)]
+// after – single derive(Clone)
+#[derive(Debug, PartialEq, Clone)]
 pub(crate) enum BlockData {
     Owned(Vec<u8>),
     Cached(CachedBlock),
 }
+
 
 /// Blocks are cached in memory and are shared between the disk task and peer
 /// session tasks. Therefore we use atomic reference counting to make sure that

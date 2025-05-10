@@ -14,7 +14,6 @@ impl<'a> IoVec<&'a [u8]> {
     pub fn from_slice(buf: &'a [u8]) -> Self {
         IoVec { inner: buf }
     }
-
     /// Access as an immutable slice.
     pub fn as_slice(&self) -> &'a [u8] {
         self.inner
@@ -26,13 +25,11 @@ impl<'a> IoVec<&'a mut [u8]> {
     pub fn from_mut_slice(buf: &'a mut [u8]) -> Self {
         IoVec { inner: buf }
     }
-
-    /// Access as an immutable slice (tied to &self's borrow).
+    /// Access as an immutable slice.
     pub fn as_slice(&self) -> &[u8] {
         self.inner
     }
-
-    /// Access as a mutable slice (tied to &mut self's borrow).
+    /// Access as a mutable slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.inner
     }
@@ -57,7 +54,7 @@ pub struct IoVecs<'buf, 'slice> {
 
 impl<'buf, 'slice> IoVecs<'buf, 'slice> {
     /// Create an I/O vector view bounded to at most `max_len` bytes.
-    /// Splits the view if the total length exceeds `max_len`.
+    /// Splits the view if the total length reaches or exceeds `max_len`.
     /// Panics if `max_len == 0`.
     pub fn bounded(
         bufs: &'buf mut [IoVec<&'slice [u8]>],
@@ -66,39 +63,40 @@ impl<'buf, 'slice> IoVecs<'buf, 'slice> {
         assert!(max_len > 0, "max_len must be > 0");
 
         let mut acc = 0;
-        // find first buffer where cumulative length > max_len
-        if let Some(i) = bufs.iter().position(|b| {
-            acc += b.as_slice().len();
-            acc > max_len
-        }) {
-            if acc == max_len {
-                // split exactly at a buffer boundary
-                if i + 1 == bufs.len() {
-                    // no split needed
-                    IoVecs::unbounded(bufs)
-                } else {
-                    IoVecs {
-                        bufs,
-                        split: Some(Split { pos: i, second: None }),
+        for (i, buf) in bufs.iter().enumerate() {
+            let len = buf.as_slice().len();
+            acc += len;
+
+            if acc >= max_len {
+                // exact boundary
+                if acc == max_len {
+                    if i + 1 == bufs.len() {
+                        // fits exactly and no remainder
+                        return IoVecs::unbounded(bufs);
+                    } else {
+                        return IoVecs {
+                            bufs,
+                            split: Some(Split { pos: i, second: None }),
+                        };
                     }
                 }
-            } else {
-                // split within bufs[i]
-                let prev = acc - bufs[i].as_slice().len();
+                // split within this buffer
+                let prev = acc - len;
                 let cut = max_len - prev;
-                let whole = bufs[i].as_slice();
+                let whole = buf.as_slice();
                 let first = &whole[..cut];
                 let second = &whole[cut..];
+                // replace buf[i] with its first part
                 bufs[i] = IoVec::from_slice(first);
-                IoVecs {
+                return IoVecs {
                     bufs,
                     split: Some(Split { pos: i, second: Some(second) }),
-                }
+                };
             }
-        } else {
-            // fits entirely
-            IoVecs::unbounded(bufs)
         }
+
+        // total size < max_len
+        IoVecs::unbounded(bufs)
     }
 
     /// Create an unbounded view (no split).
@@ -123,6 +121,7 @@ impl<'buf, 'slice> IoVecs<'buf, 'slice> {
             return;
         }
 
+        // count how many buffers to drop
         let mut dropped = 0;
         let mut removed = 0;
         for buf in self.as_slice() {
@@ -134,20 +133,16 @@ impl<'buf, 'slice> IoVecs<'buf, 'slice> {
             dropped += 1;
         }
 
-        // Drop consumed buffers
-        let rem = std::mem::take(&mut self.bufs);
-        self.bufs = &mut rem[dropped..];
+        // drop consumed buffers
+        let remainder = std::mem::take(&mut self.bufs);
+        self.bufs = &mut remainder[dropped..];
 
-        // Adjust split position
+        // adjust split position
         if let Some(sp) = &mut self.split {
-            if dropped > sp.pos {
-                sp.pos = 0;
-            } else {
-                sp.pos -= dropped;
-            }
+            sp.pos = sp.pos.saturating_sub(dropped);
         }
 
-        // Shrink the next buffer if partially consumed
+        // shrink the next buffer if partial
         let left = n - removed;
         if left > 0 && !self.bufs.is_empty() {
             let buf = self.bufs[0].as_slice();
@@ -159,16 +154,18 @@ impl<'buf, 'slice> IoVecs<'buf, 'slice> {
 
     /// Consume `self` and return the second half of the split (or empty if none).
     pub fn into_tail(mut self) -> &'buf mut [IoVec<&'slice [u8]>] {
-        // Take split metadata first to release borrow on self
         let split = self.split.take();
         if let Some(Split { pos, second }) = split {
             if let Some(sec) = second {
-                // Restore the second half into the buffer at `pos`
+                // split within a buffer: restore second-half there
                 self.bufs[pos] = IoVec::from_slice(sec);
+                &mut self.bufs[pos..]
+            } else {
+                // exact boundary: tail starts at pos + 1
+                &mut self.bufs[pos + 1..]
             }
-            &mut self.bufs[pos..]
         } else {
-            // No split → return an empty tail
+            // no split → empty tail
             let len = self.bufs.len();
             &mut self.bufs[len..]
         }
@@ -184,6 +181,7 @@ pub fn advance<'a>(
         return bufs;
     }
 
+    // count drop
     let mut dropped = 0;
     let mut removed = 0;
     for b in bufs.iter() {
@@ -200,7 +198,7 @@ pub fn advance<'a>(
     if left > 0 && !rest.is_empty() {
         let slice = rest[0].as_mut_slice();
         assert!(left <= slice.len(), "overflow advance");
-        // SAFETY: creating a subslice of the original `&mut [u8]`.
+        // SAFETY: slicing a live mutable slice
         let new = unsafe {
             slice::from_raw_parts_mut(slice.as_mut_ptr().add(left), slice.len() - left)
         };
@@ -215,8 +213,9 @@ mod tests {
 
     #[test]
     fn bounded_split_at_boundary() {
-        let mut data = vec![[0u8; 16], [0u8; 16]];
-        let mut bufs: Vec<_> = data.iter().map(|d| IoVec::from_slice(&d[..])).collect();
+        let data = vec![[0u8; 16], [0u8; 16]];
+        let mut bufs: Vec<_> =
+            data.iter().map(|d| IoVec::from_slice(&d[..])).collect();
         let iov = IoVecs::bounded(&mut bufs, 16);
         assert_eq!(iov.as_slice().len(), 1);
         let tail = iov.into_tail();
@@ -225,8 +224,9 @@ mod tests {
 
     #[test]
     fn bounded_split_within() {
-        let mut data = vec![[1u8; 10], [2u8; 10]];
-        let mut bufs: Vec<_> = data.iter().map(|d| IoVec::from_slice(&d[..])).collect();
+        let data = vec![[1u8; 10], [2u8; 10]];
+        let mut bufs: Vec<_> =
+            data.iter().map(|d| IoVec::from_slice(&d[..])).collect();
         let iov = IoVecs::bounded(&mut bufs, 12);
         let first = iov.as_slice();
         assert_eq!(first.len(), 2);
@@ -238,8 +238,9 @@ mod tests {
 
     #[test]
     fn advance_partial() {
-        let mut data = vec![[0u8; 5], [0u8; 5]];
-        let mut bufs: Vec<_> = data.iter().map(|d| IoVec::from_slice(&d[..])).collect();
+        let data = vec![[0u8; 5], [0u8; 5]];
+        let mut bufs: Vec<_> =
+            data.iter().map(|d| IoVec::from_slice(&d[..])).collect();
         let mut iov = IoVecs::bounded(&mut bufs, 10);
         iov.advance(3);
         assert_eq!(iov.as_slice()[0].as_slice().len(), 2);
