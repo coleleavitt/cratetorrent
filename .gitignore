@@ -1,4 +1,8 @@
+# Ignore all target directories throughout the project
 /target
+**/target/
+
+# Your existing entries
 Cargo.lock
 scratch*
 tests/assets
